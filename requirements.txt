@@ -2,3 +2,8 @@ streamlit
 psycopg2-binary
 pandas
 python-dotenv
+flask
+picamera2
+opencv-python-headless
+google-cloud-vision
+google-cloud-storage

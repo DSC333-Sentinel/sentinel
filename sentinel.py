@@ -338,18 +338,22 @@ if page == "Live Feed":
  
     with feed_col:
         st.markdown("**Camera Feed**")
-        st.markdown("""
-        <div style="background:#161922;border:1px solid #2a2d3a;border-radius:10px;
-                    height:380px;display:flex;flex-direction:column;
-                    align-items:center;justify-content:center;
-                    color:#6b7280;font-family:'Space Mono',monospace;
-                    font-size:0.85rem;letter-spacing:0.05em;">
-            <div style="font-size:3rem;margin-bottom:12px;">📷</div>
-            <div>CAMERA FEED</div>
-            <div style="font-size:0.7rem;margin-top:6px;color:#444;">RPI stream not connected</div>
-        </div>
-        """, unsafe_allow_html=True)
-        st.caption("Configure the stream URL in Settings once the RPI camera module is set up.")
+        rpi_url = os.getenv("RPI_STREAM_URL", "")
+        if rpi_url:
+            st.image(rpi_url, use_container_width=True)
+        else:
+            st.markdown("""
+            <div style="background:#161922;border:1px solid #2a2d3a;border-radius:10px;
+                        height:380px;display:flex;flex-direction:column;
+                        align-items:center;justify-content:center;
+                        color:#6b7280;font-family:'Space Mono',monospace;
+                        font-size:0.85rem;letter-spacing:0.05em;">
+                <div style="font-size:3rem;margin-bottom:12px;">📷</div>
+                <div>CAMERA FEED</div>
+                <div style="font-size:0.7rem;margin-top:6px;color:#444;">RPI stream not connected</div>
+            </div>
+            """, unsafe_allow_html=True)
+            st.caption("Add RPI_STREAM_URL to your .env file to activate the feed.")
  
     with info_col:
         st.markdown("**Recent Events**")
