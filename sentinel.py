@@ -17,6 +17,7 @@ import os
 from dotenv import load_dotenv
 from datetime import datetime, timedelta
 import random
+import cv2
  
 load_dotenv()
 
@@ -141,8 +142,19 @@ def get_cursor(conn):
 
 # SCHEMA INIT
 def init_db(conn):
-    """Creates the zones and events tables if they don't exist yet."""
+    """Creates all tables if they don't exist yet."""
     with conn.cursor() as cur:
+        # cameras must be created first — zones references it
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS cameras (
+                id         SERIAL PRIMARY KEY,
+                name       TEXT NOT NULL,
+                stream_url TEXT NOT NULL,
+                location   TEXT,
+                active     BOOLEAN DEFAULT TRUE,
+                created_at TIMESTAMP DEFAULT NOW()
+            );
+        """)
         cur.execute("""
             CREATE TABLE IF NOT EXISTS zones (
                 id          SERIAL PRIMARY KEY,
@@ -152,6 +164,7 @@ def init_db(conn):
                 y1          REAL NOT NULL,
                 x2          REAL NOT NULL,
                 y2          REAL NOT NULL,
+                camera_id   INTEGER REFERENCES cameras(id) ON DELETE SET NULL,
                 created_at  TIMESTAMP DEFAULT NOW()
             );
         """)
@@ -165,15 +178,11 @@ def init_db(conn):
                 snapshot_path  TEXT
             );
         """)
+        # Migration safety net — adds camera_id to zones if it was created
+        # before this schema change (e.g. your own existing database)
         cur.execute("""
-            CREATE TABLE IF NOT EXISTS cameras (
-                id         SERIAL PRIMARY KEY,
-                name       TEXT NOT NULL,
-                stream_url TEXT NOT NULL,
-                location   TEXT,
-                active     BOOLEAN DEFAULT TRUE,
-                created_at TIMESTAMP DEFAULT NOW()
-            );
+            ALTER TABLE zones ADD COLUMN IF NOT EXISTS
+            camera_id INTEGER REFERENCES cameras(id) ON DELETE SET NULL;
         """)
         conn.commit()
 
@@ -240,23 +249,30 @@ def fetch_events(conn, zone_id=None, detection_type=None, alert_level=None, limi
         cur.execute(sql, params)
         return cur.fetchall()
  
-def fetch_zones(conn):
+def fetch_zones(conn, camera_id=None):
     with get_cursor(conn) as cur:
-        cur.execute("""
+        sql = """
             SELECT z.id, z.name, z.alert_level, z.x1, z.y1, z.x2, z.y2,
+                   z.camera_id, c.name AS camera_name,
                    COUNT(e.id) AS event_count
             FROM zones z
             LEFT JOIN events e ON e.zone_id = z.id
-            GROUP BY z.id ORDER BY z.id;
-        """)
+            LEFT JOIN cameras c ON z.camera_id = c.id
+            WHERE 1=1
+        """
+        params = []
+        if camera_id:
+            sql += " AND z.camera_id = %s"; params.append(camera_id)
+        sql += " GROUP BY z.id, c.name ORDER BY z.id"
+        cur.execute(sql, params)
         return cur.fetchall()
  
-def insert_zone(conn, name, alert_level, x1, y1, x2, y2):
+def insert_zone(conn, name, alert_level, x1, y1, x2, y2, camera_id=None):
     with conn.cursor() as cur:
         cur.execute("""
-            INSERT INTO zones (name, alert_level, x1, y1, x2, y2)
-            VALUES (%s, %s, %s, %s, %s, %s);
-        """, (name, alert_level, x1, y1, x2, y2))
+            INSERT INTO zones (name, alert_level, x1, y1, x2, y2, camera_id)
+            VALUES (%s, %s, %s, %s, %s, %s, %s);
+        """, (name, alert_level, x1, y1, x2, y2, camera_id))
         conn.commit()
  
 def delete_zone(conn, zone_id):
@@ -291,6 +307,14 @@ def insert_camera(conn, name, stream_url, location):
 def delete_camera(conn, camera_id):
     with conn.cursor() as cur:
         cur.execute("DELETE FROM cameras WHERE id = %s;", (camera_id,))
+        conn.commit()
+
+def update_camera(conn, camera_id, name, stream_url, location):
+    with conn.cursor() as cur:
+        cur.execute("""
+            UPDATE cameras SET name=%s, stream_url=%s, location=%s
+            WHERE id=%s;
+        """, (name, stream_url, location, camera_id))
         conn.commit()
 
 # CONNECT & INIT
@@ -332,8 +356,22 @@ with st.sidebar:
         st.markdown('<span class="badge badge-green">● DB CONNECTED</span>', unsafe_allow_html=True)
     else:
         st.markdown('<span class="badge badge-red">● DB OFFLINE</span>', unsafe_allow_html=True)
-    st.caption("Camera · Not connected yet")
-    st.caption("GCP Vision · Not configured")
+    # Camera status — check if any active cameras exist in DB
+    if db_ok:
+        cams = fetch_cameras(conn)
+        if cams:
+            st.markdown(f'<span class="badge badge-green">● {len(cams)} Camera(s) Active</span>', unsafe_allow_html=True)
+        else:
+            st.markdown('<span class="badge badge-red">● No Cameras Added</span>', unsafe_allow_html=True)
+    else:
+        st.caption("Camera · DB offline")
+
+    # GCP Vision status — check credentials file exists
+    creds_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "")
+    if creds_path and os.path.exists(creds_path):
+        st.markdown('<span class="badge badge-green">● GCP Vision Ready</span>', unsafe_allow_html=True)
+    else:
+        st.markdown('<span class="badge badge-red">● GCP Vision Not Configured</span>', unsafe_allow_html=True)
  
     st.markdown("---")
     if db_ok:
@@ -459,58 +497,148 @@ elif page == "Event History":
 # PAGE: SMART ZONES
 elif page == "Smart Zones":
     st.markdown('<div class="page-header">// SMART ZONES</div>', unsafe_allow_html=True)
- 
+
     st.markdown("""
     <div class="info-box">
-        📌 Zones define regions in the camera frame. Coordinates are <b>normalized (0.0–1.0)</b>
-        relative to frame width/height. Each zone has its own alert level.
+        📌 Zones define regions in the camera frame. Select a camera to preview its stream
+        and configure zones for it. Coordinates are <b>normalized (0.0–1.0)</b> relative to frame width/height.
     </div>
     """, unsafe_allow_html=True)
- 
-    zones_col, form_col = st.columns([1.4, 1])
- 
-    with zones_col:
-        st.markdown("**Configured Zones**")
-        zones = fetch_zones(conn)
-        if zones:
-            for z in zones:
-                badge  = ALERT_BADGE.get(z["alert_level"], "")
-                coords = f"({z['x1']:.2f}, {z['y1']:.2f}) → ({z['x2']:.2f}, {z['y2']:.2f})"
-                st.markdown(f"""
-                <div class="zone-card">
-                    <h4>{z['name']}</h4>
-                    <p>Coordinates: <code style="color:#00e5ff">{coords}</code></p>
-                    <p style="margin-top:6px;">Alert Level: {badge} &nbsp;·&nbsp; Events: <b style="color:#e8eaf0">{z['event_count']}</b></p>
+
+    # Camera selector
+    cameras = fetch_cameras(conn)
+    if not cameras:
+        st.warning("No cameras configured yet. Go to the Cameras page to add one first.")
+    else:
+        cam_options = {c["name"]: c["id"] for c in cameras}
+        selected_cam_name = st.selectbox("Select Camera", list(cam_options.keys()))
+        selected_cam_id   = cam_options[selected_cam_name]
+        selected_cam_url  = next(c["stream_url"] for c in cameras if c["id"] == selected_cam_id)
+
+        st.markdown("---")
+        zones_col, form_col = st.columns([1.4, 1])
+
+        with zones_col:
+            # Camera preview
+            st.markdown(f"**Preview — {selected_cam_name}**")
+            try:
+                st.image(selected_cam_url, use_container_width=True)
+            except Exception:
+                st.markdown("""
+                <div style="background:#161922;border:1px solid #2a2d3a;border-radius:10px;
+                            height:200px;display:flex;align-items:center;justify-content:center;
+                            color:#6b7280;font-family:'Space Mono',monospace;font-size:0.8rem;">
+                    Stream unavailable
                 </div>
                 """, unsafe_allow_html=True)
-                st.markdown('<div class="danger-btn">', unsafe_allow_html=True)
-                if st.button(f"🗑 Delete '{z['name']}'", key=f"del_{z['id']}"):
-                    delete_zone(conn, z["id"])
-                    st.success(f"Zone '{z['name']}' deleted.")
-                    st.rerun()
-                st.markdown('</div>', unsafe_allow_html=True)
-        else:
-            st.caption("No zones yet. Add one using the form.")
- 
-    with form_col:
-        st.markdown("**Add New Zone**")
-        with st.form("add_zone_form", clear_on_submit=True):
+
+            st.markdown(f"**Zones for {selected_cam_name}**")
+            zones = fetch_zones(conn, camera_id=selected_cam_id)
+            if zones:
+                for z in zones:
+                    badge  = ALERT_BADGE.get(z["alert_level"], "")
+                    coords = f"({z['x1']:.2f}, {z['y1']:.2f}) → ({z['x2']:.2f}, {z['y2']:.2f})"
+                    st.markdown(f"""
+                    <div class="zone-card">
+                        <h4>{z['name']}</h4>
+                        <p>Coordinates: <code style="color:#00e5ff">{coords}</code></p>
+                        <p style="margin-top:6px;">Alert Level: {badge} &nbsp;·&nbsp; Events: <b style="color:#e8eaf0">{z['event_count']}</b></p>
+                    </div>
+                    """, unsafe_allow_html=True)
+                    st.markdown('<div class="danger-btn">', unsafe_allow_html=True)
+                    if st.button(f"🗑 Delete '{z['name']}'", key=f"del_{z['id']}"):
+                        delete_zone(conn, z["id"])
+                        st.success(f"Zone '{z['name']}' deleted.")
+                        st.rerun()
+                    st.markdown('</div>', unsafe_allow_html=True)
+            else:
+                st.caption(f"No zones for {selected_cam_name} yet. Add one using the form.")
+
+        with form_col:
+            st.markdown("**Add New Zone**")
+
             zone_name = st.text_input("Zone Name", placeholder="e.g. Front Door")
             alert_lvl = st.selectbox("Alert Level", ["HIGH", "MEDIUM", "LOW"])
+
             st.markdown("**Bounding Box** *(0.0 – 1.0)*")
-            c1, c2 = st.columns(2)
-            x1 = c1.number_input("X1 (left)",   0.0, 1.0, 0.0, 0.01)
-            y1 = c2.number_input("Y1 (top)",    0.0, 1.0, 0.0, 0.01)
-            x2 = c1.number_input("X2 (right)",  0.0, 1.0, 0.5, 0.01)
-            y2 = c2.number_input("Y2 (bottom)", 0.0, 1.0, 0.5, 0.01)
-            if st.form_submit_button("➕ Add Zone"):
+            x1 = st.slider("X1 (left)",   0.0, 1.0, 0.0, 0.01, key="zx1")
+            y1 = st.slider("Y1 (top)",    0.0, 1.0, 0.0, 0.01, key="zy1")
+            x2 = st.slider("X2 (right)",  0.0, 1.0, 0.5, 0.01, key="zx2")
+            y2 = st.slider("Y2 (bottom)", 0.0, 1.0, 0.5, 0.01, key="zy2")
+
+            # ── Zone Preview ──────────────────────────────
+            st.markdown("**Zone Preview**")
+
+            cap_col, _ = st.columns([1, 1])
+            with cap_col:
+                if st.button("📸 Capture Frame", key="capture_preview"):
+                    frame_bytes = None
+                    try:
+                        import requests as req
+                        resp = req.get(selected_cam_url, stream=True, timeout=5)
+                        buf  = b""
+                        for chunk in resp.iter_content(chunk_size=4096):
+                            buf += chunk
+                            s = buf.find(b"\xff\xd8")
+                            e = buf.find(b"\xff\xd9")
+                            if s != -1 and e != -1 and e > s:
+                                frame_bytes = buf[s:e + 2]
+                                break
+                    except Exception:
+                        pass
+                    if frame_bytes:
+                        st.session_state["preview_frame"] = frame_bytes
+                    else:
+                        st.error("Could not grab frame. Is the stream running?")
+
+            if "preview_frame" in st.session_state:
+                import numpy as np
+                frame_arr = np.frombuffer(st.session_state["preview_frame"], np.uint8)
+                frame_bgr = cv2.imdecode(frame_arr, cv2.IMREAD_COLOR)
+
+                if frame_bgr is not None:
+                    h, w = frame_bgr.shape[:2]
+
+                    # Draw all existing zones for this camera in grey
+                    existing_zones = fetch_zones(conn, camera_id=selected_cam_id)
+                    for z in existing_zones:
+                        px1 = int(z["x1"] * w); py1 = int(z["y1"] * h)
+                        px2 = int(z["x2"] * w); py2 = int(z["y2"] * h)
+                        cv2.rectangle(frame_bgr, (px1, py1), (px2, py2), (100, 100, 100), 1)
+                        cv2.putText(frame_bgr, z["name"], (px1 + 4, py1 + 14),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (100, 100, 100), 1)
+
+                    # Draw the new zone being configured in cyan
+                    if x2 > x1 and y2 > y1:
+                        nx1 = int(x1 * w); ny1 = int(y1 * h)
+                        nx2 = int(x2 * w); ny2 = int(y2 * h)
+                        cv2.rectangle(frame_bgr, (nx1, ny1), (nx2, ny2), (0, 229, 255), 2)
+                        label = zone_name.strip() if zone_name.strip() else "New Zone"
+                        cv2.putText(frame_bgr, label, (nx1 + 4, ny1 + 16),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 229, 255), 1)
+
+                    frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+                    st.image(frame_rgb, use_container_width=True)
+            else:
+                st.markdown("""
+                <div style="background:#161922;border:1px solid #2a2d3a;border-radius:8px;
+                            height:140px;display:flex;align-items:center;justify-content:center;
+                            color:#6b7280;font-family:'Space Mono',monospace;font-size:0.75rem;">
+                    Press 📸 Capture Frame to preview
+                </div>
+                """, unsafe_allow_html=True)
+
+            # ── Submit ────────────────────────────────────
+            st.markdown("")
+            if st.button("➕ Add Zone", key="add_zone_btn", use_container_width=True):
                 if not zone_name.strip():
                     st.error("Zone name cannot be empty.")
                 elif x2 <= x1 or y2 <= y1:
                     st.error("X2 must be > X1 and Y2 must be > Y1.")
                 else:
-                    insert_zone(conn, zone_name.strip(), alert_lvl, x1, y1, x2, y2)
-                    st.success(f"Zone '{zone_name}' added!")
+                    insert_zone(conn, zone_name.strip(), alert_lvl, x1, y1, x2, y2, selected_cam_id)
+                    st.session_state.pop("preview_frame", None)
+                    st.success(f"Zone '{zone_name}' added to {selected_cam_name}!")
                     st.rerun()
 
 # PAGE: CAMERAS
@@ -539,12 +667,38 @@ elif page == "Cameras":
                     <p style="margin-top:4px;">URL: <code style="color:#00e5ff">{cam['stream_url']}</code></p>
                 </div>
                 """, unsafe_allow_html=True)
-                st.markdown('<div class="danger-btn">', unsafe_allow_html=True)
-                if st.button(f"🗑 Delete '{cam['name']}'", key=f"delcam_{cam['id']}"):
-                    delete_camera(conn, cam["id"])
-                    st.success(f"Camera '{cam['name']}' removed.")
-                    st.rerun()
-                st.markdown('</div>', unsafe_allow_html=True)
+
+                edit_col, del_col = st.columns([1, 1])
+                with edit_col:
+                    if st.button(f"✏️ Edit '{cam['name']}'", key=f"editcam_{cam['id']}"):
+                        st.session_state[f"editing_cam"] = cam["id"]
+                with del_col:
+                    st.markdown('<div class="danger-btn">', unsafe_allow_html=True)
+                    if st.button(f"🗑 Delete", key=f"delcam_{cam['id']}"):
+                        delete_camera(conn, cam["id"])
+                        st.success(f"Camera '{cam['name']}' removed.")
+                        st.rerun()
+                    st.markdown('</div>', unsafe_allow_html=True)
+
+                # Inline edit form
+                if st.session_state.get("editing_cam") == cam["id"]:
+                    with st.form(f"edit_cam_form_{cam['id']}", clear_on_submit=True):
+                        st.markdown("**Edit Camera**")
+                        new_name     = st.text_input("Camera Name", value=cam["name"])
+                        new_url      = st.text_input("Stream URL",  value=cam["stream_url"])
+                        new_location = st.text_input("Location",    value=cam["location"] or "")
+                        s1, s2 = st.columns(2)
+                        if s1.form_submit_button("💾 Save"):
+                            if not new_name.strip() or not new_url.strip():
+                                st.error("Name and URL cannot be empty.")
+                            else:
+                                update_camera(conn, cam["id"], new_name.strip(), new_url.strip(), new_location.strip() or None)
+                                st.session_state.pop("editing_cam", None)
+                                st.success("Camera updated!")
+                                st.rerun()
+                        if s2.form_submit_button("✖ Cancel"):
+                            st.session_state.pop("editing_cam", None)
+                            st.rerun()
         else:
             st.caption("No cameras yet. Add one using the form.")
 
