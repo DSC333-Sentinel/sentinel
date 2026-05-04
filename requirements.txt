@@ -8,3 +8,5 @@ opencv-python-headless
 google-cloud-vision
 google-cloud-storage
 requests
+fastapi
+uvicorn

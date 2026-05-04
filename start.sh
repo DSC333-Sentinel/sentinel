@@ -12,12 +12,18 @@ echo ""
 cleanup() {
     echo ""
     echo "[sentinel] Shutting down..."
-    kill $DETECT_PID $STREAMLIT_PID 2>/dev/null
+    kill $API_PID $DETECT_PID $STREAMLIT_PID 2>/dev/null
     exit 0
 }
 trap cleanup SIGINT SIGTERM
 
 # Start detection pipeline in background
+echo "[sentinel] Starting API..."
+uvicorn sentinel_api:app --port 8000 &
+API_PID=$!
+
+sleep 2
+
 echo "[sentinel] Starting detection pipeline..."
 python3 sentinel_detect.py &
 DETECT_PID=$!
