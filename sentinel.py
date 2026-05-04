@@ -3,6 +3,8 @@
 Sentinel Streamlit Dashboard
 Jose and Aylin
 DSC 333 Final Project · Spring 2026
+==============================
+
 Note, to run use:
 streamlit run sentinel.py
 """
