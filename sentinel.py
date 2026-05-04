@@ -1,9 +1,11 @@
 
-# Sentinel Streamlit Dashboard
-# Jose and Aylin
-# DSC 333 Final Project · Spring 2026
-# Note, to run use:
-# streamlit run sentinel.py
+"""
+Sentinel Streamlit Dashboard
+Jose and Aylin
+DSC 333 Final Project · Spring 2026
+Note, to run use:
+streamlit run sentinel.py
+"""
 
 import streamlit as st
 import psycopg2
@@ -15,6 +17,9 @@ from datetime import datetime, timedelta
 import random
  
 load_dotenv()
+
+SNAPSHOT_DIR = os.getenv("SNAPSHOT_DIR", "snapshots")
+os.makedirs(SNAPSHOT_DIR, exist_ok=True)
 
 # PAGE CONFIGURATION
 st.set_page_config(
@@ -158,6 +163,16 @@ def init_db(conn):
                 snapshot_path  TEXT
             );
         """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS cameras (
+                id         SERIAL PRIMARY KEY,
+                name       TEXT NOT NULL,
+                stream_url TEXT NOT NULL,
+                location   TEXT,
+                active     BOOLEAN DEFAULT TRUE,
+                created_at TIMESTAMP DEFAULT NOW()
+            );
+        """)
         conn.commit()
 
 # SEED DATA
@@ -258,6 +273,24 @@ def fetch_summary(conn):
         zone_count = cur.fetchone()["c"]
     return events_today, high_alerts, zone_count
 
+def fetch_cameras(conn):
+    with get_cursor(conn) as cur:
+        cur.execute("SELECT * FROM cameras WHERE active = TRUE ORDER BY id;")
+        return cur.fetchall()
+
+def insert_camera(conn, name, stream_url, location):
+    with conn.cursor() as cur:
+        cur.execute("""
+            INSERT INTO cameras (name, stream_url, location)
+            VALUES (%s, %s, %s);
+        """, (name, stream_url, location))
+        conn.commit()
+
+def delete_camera(conn, camera_id):
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM cameras WHERE id = %s;", (camera_id,))
+        conn.commit()
+
 # CONNECT & INIT
 db_ok    = False
 conn     = None
@@ -287,7 +320,7 @@ with st.sidebar:
  
     page = st.selectbox(
         "Navigate",
-        ["Live Feed", "Event History", "Smart Zones", "Settings"],
+        ["Live Feed", "Event History", "Smart Zones", "Cameras", "Settings"],
         label_visibility="collapsed",
     )
  
@@ -338,9 +371,14 @@ if page == "Live Feed":
  
     with feed_col:
         st.markdown("**Camera Feed**")
-        rpi_url = os.getenv("RPI_STREAM_URL", "")
-        if rpi_url:
-            st.image(rpi_url, use_container_width=True)
+        cameras = fetch_cameras(conn)
+        if cameras:
+            grid = st.columns(2)
+            for i, cam in enumerate(cameras):
+                with grid[i % 2]:
+                    location_label = f" — {cam['location']}" if cam["location"] else ""
+                    st.markdown(f"<span style='font-family:var(--mono);color:var(--accent);font-size:0.82rem;'>{cam['name']}{location_label}</span>", unsafe_allow_html=True)
+                    st.image(cam["stream_url"], use_container_width=True)
         else:
             st.markdown("""
             <div style="background:#161922;border:1px solid #2a2d3a;border-radius:10px;
@@ -350,10 +388,10 @@ if page == "Live Feed":
                         font-size:0.85rem;letter-spacing:0.05em;">
                 <div style="font-size:3rem;margin-bottom:12px;">📷</div>
                 <div>CAMERA FEED</div>
-                <div style="font-size:0.7rem;margin-top:6px;color:#444;">RPI stream not connected</div>
+                <div style="font-size:0.7rem;margin-top:6px;color:#444;">No cameras configured yet</div>
             </div>
             """, unsafe_allow_html=True)
-            st.caption("Add RPI_STREAM_URL to your .env file to activate the feed.")
+            st.caption("Go to the Cameras page to add a stream.")
  
     with info_col:
         st.markdown("**Recent Events**")
@@ -473,6 +511,57 @@ elif page == "Smart Zones":
                     st.success(f"Zone '{zone_name}' added!")
                     st.rerun()
 
+# PAGE: CAMERAS
+elif page == "Cameras":
+    st.markdown('<div class="page-header">// CAMERAS</div>', unsafe_allow_html=True)
+
+    st.markdown("""
+    <div class="info-box">
+        Add camera streams here. Each stream URL should point to a running
+        <code>sentinel_camera.py</code> instance. They will appear as a grid on the Live Feed page.
+    </div>
+    """, unsafe_allow_html=True)
+
+    cameras_col, form_col = st.columns([1.4, 1])
+
+    with cameras_col:
+        st.markdown("**Registered Cameras**")
+        cameras = fetch_cameras(conn)
+        if cameras:
+            for cam in cameras:
+                location_label = cam["location"] or "No location set"
+                st.markdown(f"""
+                <div class="zone-card">
+                    <h4>{cam['name']}</h4>
+                    <p>Location: <b style="color:#e8eaf0">{location_label}</b></p>
+                    <p style="margin-top:4px;">URL: <code style="color:#00e5ff">{cam['stream_url']}</code></p>
+                </div>
+                """, unsafe_allow_html=True)
+                st.markdown('<div class="danger-btn">', unsafe_allow_html=True)
+                if st.button(f"🗑 Delete '{cam['name']}'", key=f"delcam_{cam['id']}"):
+                    delete_camera(conn, cam["id"])
+                    st.success(f"Camera '{cam['name']}' removed.")
+                    st.rerun()
+                st.markdown('</div>', unsafe_allow_html=True)
+        else:
+            st.caption("No cameras yet. Add one using the form.")
+
+    with form_col:
+        st.markdown("**Add New Camera**")
+        with st.form("add_camera_form", clear_on_submit=True):
+            cam_name     = st.text_input("Camera Name",   placeholder="e.g. Front Door Cam")
+            cam_url      = st.text_input("Stream URL",    placeholder="http://192.168.1.10:8080/stream")
+            cam_location = st.text_input("Location",      placeholder="e.g. Front Porch")
+            if st.form_submit_button("➕ Add Camera"):
+                if not cam_name.strip():
+                    st.error("Camera name cannot be empty.")
+                elif not cam_url.strip():
+                    st.error("Stream URL cannot be empty.")
+                else:
+                    insert_camera(conn, cam_name.strip(), cam_url.strip(), cam_location.strip() or None)
+                    st.success(f"Camera '{cam_name}' added!")
+                    st.rerun()
+
 # PAGE: SETTINGS
 elif page == "Settings":
     st.markdown('<div class="page-header">// SETTINGS</div>', unsafe_allow_html=True)
@@ -494,7 +583,11 @@ elif page == "Settings":
  
     st.markdown("---")
     st.markdown("**Camera**")
-    st.text_input("RPI Stream URL", placeholder="http://raspberrypi.local:8080/stream")
+    st.markdown("""
+    <div class="info-box">
+        Camera streams are managed on the <b>Cameras</b> page.
+    </div>
+    """, unsafe_allow_html=True)
     c1, c2 = st.columns(2)
     c1.number_input("Capture Interval (seconds)", 1, 60, 5)
     c2.number_input("Motion Sensitivity (0–100)", 0, 100, 50)
@@ -502,8 +595,7 @@ elif page == "Settings":
     st.markdown("---")
     st.markdown("**GCP Configuration**")
     c1, c2 = st.columns(2)
-    c1.text_input("GCP Project ID",       placeholder="my-gcp-project")
-    c1.text_input("Cloud Storage Bucket", placeholder="sentinel-snapshots")
+    c1.text_input("GCP Project ID", placeholder="my-gcp-project")
     c2.selectbox("Vision API Model", ["builtin/stable", "builtin/latest"])
  
     st.markdown("---")

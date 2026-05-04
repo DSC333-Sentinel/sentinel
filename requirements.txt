@@ -3,7 +3,8 @@ psycopg2-binary
 pandas
 python-dotenv
 flask
-picamera2
+opencv-python
 opencv-python-headless
 google-cloud-vision
 google-cloud-storage
+picamera2
