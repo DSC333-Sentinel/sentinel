@@ -378,7 +378,7 @@ if page == "Live Feed":
                 with grid[i % 2]:
                     location_label = f" — {cam['location']}" if cam["location"] else ""
                     st.markdown(f"<span style='font-family:var(--mono);color:var(--accent);font-size:0.82rem;'>{cam['name']}{location_label}</span>", unsafe_allow_html=True)
-                    st.image(cam["stream_url"], use_container_width=True)
+                    st.image(cam["stream_url"], width='stretch')
         else:
             st.markdown("""
             <div style="background:#161922;border:1px solid #2a2d3a;border-radius:10px;
@@ -601,7 +601,7 @@ elif page == "Settings":
     st.markdown("---")
     st.markdown("**Danger Zone**")
     st.markdown('<div class="danger-btn">', unsafe_allow_html=True)
-    if st.button("🗑 Clear All Events"):
+    if st.button("Clear All Events"):
         with conn.cursor() as cur:
             cur.execute("DELETE FROM events;")
             conn.commit()
