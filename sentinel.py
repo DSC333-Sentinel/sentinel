@@ -522,7 +522,7 @@ elif page == "Smart Zones":
             # Camera preview
             st.markdown(f"**Preview — {selected_cam_name}**")
             try:
-                st.image(selected_cam_url, use_container_width=True)
+                st.image(selected_cam_url, width='stretch')
             except Exception:
                 st.markdown("""
                 <div style="background:#161922;border:1px solid #2a2d3a;border-radius:10px;
@@ -618,7 +618,7 @@ elif page == "Smart Zones":
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 229, 255), 1)
 
                     frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-                    st.image(frame_rgb, use_container_width=True)
+                    st.image(frame_rgb, width='stretch')
             else:
                 st.markdown("""
                 <div style="background:#161922;border:1px solid #2a2d3a;border-radius:8px;
@@ -630,7 +630,7 @@ elif page == "Smart Zones":
 
             # ── Submit ────────────────────────────────────
             st.markdown("")
-            if st.button("➕ Add Zone", key="add_zone_btn", use_container_width=True):
+            if st.button("➕ Add Zone", key="add_zone_btn", width='stretch'):
                 if not zone_name.strip():
                     st.error("Zone name cannot be empty.")
                 elif x2 <= x1 or y2 <= y1:
