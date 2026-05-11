@@ -10,3 +10,4 @@ google-cloud-storage
 requests
 fastapi
 uvicorn
+bcrypt

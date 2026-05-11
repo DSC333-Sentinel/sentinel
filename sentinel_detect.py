@@ -4,7 +4,7 @@ Sentinel – Detection Pipeline
 Captures frames from the camera stream, runs GCP Vision object detection,
 checks zone overlap, and writes events + snapshots to the database.
 
-Run alongside sentinel.py and sentinel_camera.py:
+Run alongside all of the other python files:
     python3 sentinel_detect.py
 """
 
@@ -22,9 +22,32 @@ from google.cloud import vision
 load_dotenv()
 
 # CONFIGURATION
-CAPTURE_INTERVAL  = int(os.getenv("CAPTURE_INTERVAL", 10))   # seconds between captures
-CONFIDENCE_MIN    = float(os.getenv("CONFIDENCE_MIN", 0.55))  # minimum Vision API confidence
 SNAPSHOT_DIR      = os.getenv("SNAPSHOT_DIR", "snapshots")
+
+def load_settings():
+    """
+    Reads settings.json. If it doesn't exist, creates one with defaults.
+    """
+    import json
+    path     = "settings.json"
+    defaults = {"capture_interval": 10, "confidence_min": 0.55}
+
+    if not os.path.exists(path):
+        with open(path, "w") as f:
+            json.dump(defaults, f, indent=2)
+        print(f"[sentinel_detect] settings.json not found — created with defaults: {defaults}")
+        return defaults["capture_interval"], defaults["confidence_min"]
+
+    try:
+        with open(path) as f:
+            s = json.load(f)
+        return (
+            int(s.get("capture_interval", defaults["capture_interval"])),
+            float(s.get("confidence_min",  defaults["confidence_min"])),
+        )
+    except Exception as e:
+        print(f"[sentinel_detect] Could not read settings.json ({e}) — using defaults.")
+        return defaults["capture_interval"], defaults["confidence_min"]
 
 os.makedirs(SNAPSHOT_DIR, exist_ok=True)
 
@@ -89,20 +112,20 @@ def capture_frame(stream_url: str, timeout: int = 5):
     return None
 
 # GCP VISION DETECTION
-def detect_persons(client: vision.ImageAnnotatorClient, image_bytes: bytes) -> list:
+def detect_persons(client: vision.ImageAnnotatorClient, image_bytes: bytes, confidence_min: float) -> list:
     """
     Runs GCP Vision object localisation on image_bytes.
-    Returns a list of detected persons above CONFIDENCE_MIN,
+    Returns a list of detected persons above confidence_min,
     each with their normalized bounding box.
     """
-    image   = vision.Image(content=image_bytes)
+    image    = vision.Image(content=image_bytes)
     response = client.object_localization(image=image)
-    persons = []
+    persons  = []
 
     for obj in response.localized_object_annotations:
         if obj.name.lower() != "person":
             continue
-        if obj.score < CONFIDENCE_MIN:
+        if obj.score < confidence_min:
             continue
         verts = obj.bounding_poly.normalized_vertices
         xs = [v.x for v in verts]
@@ -143,29 +166,32 @@ def find_triggered_zone(persons: list, zones: list):
 def main():
     print("\n[sentinel_detect] Starting detection pipeline...")
 
-    # Validate GCP credentials
-    creds_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "")
-    if not creds_path or not os.path.exists(creds_path):
+    # Validate GCP credentials — always looks in secrets/gcp_credentials.json
+    creds_path = os.path.join("secrets", "gcp_credentials.json")
+    if not os.path.exists(creds_path):
         raise EnvironmentError(
-            "GOOGLE_APPLICATION_CREDENTIALS not set or file not found. "
-            "Check your .env file."
+            "GCP credentials file not found at 'secrets/gcp_credentials.json'. "
+            "Upload your service account JSON via the Settings page in the dashboard."
         )
+    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = creds_path
+    print(f"[sentinel_detect] GCP credentials loaded from {creds_path}")
 
     vision_client = vision.ImageAnnotatorClient()
     print("[sentinel_detect] GCP Vision client initialised.")
 
     conn = get_db()
     print("[sentinel_detect] Database connected.")
-    print(f"[sentinel_detect] Capturing every {CAPTURE_INTERVAL}s. Press Ctrl+C to stop.\n")
+    CAPTURE_INTERVAL, CONFIDENCE_MIN = load_settings()
+    print(f"[sentinel_detect] Capturing every {CAPTURE_INTERVAL}s, confidence: {CONFIDENCE_MIN}. Press Ctrl+C to stop.\n")
 
     try:
         while True:
+            CAPTURE_INTERVAL, CONFIDENCE_MIN = load_settings()
             cameras = fetch_cameras(conn)
             if not cameras:
                 print(f"[{datetime.now().strftime('%H:%M:%S')}] No active cameras found. Waiting...")
                 time.sleep(CAPTURE_INTERVAL)
                 continue
-
             for cam in cameras:
                 ts = datetime.now().strftime("%H:%M:%S")
                 print(f"[{ts}] Checking camera: {cam['name']} ({cam['stream_url']})")
@@ -177,7 +203,7 @@ def main():
                     continue
 
                 # Run Vision API
-                persons = detect_persons(vision_client, frame_bytes)
+                persons = detect_persons(vision_client, frame_bytes, CONFIDENCE_MIN)
                 print(f"  Persons detected: {len(persons)}")
 
                 if persons:

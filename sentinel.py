@@ -6,8 +6,13 @@ DSC 333 Final Project · Spring 2026
 Note, to run use:
     streamlit run sentinel.py
 
-Requires sentinel_api.py to be running:
+Requires sentinel_api.py and sentinel_detect.py to be running.
+
+To run sentinel_api.py:
     uvicorn sentinel_api:app --port 8000
+
+To run sentinel_detect.py:
+
 """
 
 import streamlit as st
@@ -24,6 +29,11 @@ load_dotenv()
 SNAPSHOT_DIR = os.getenv("SNAPSHOT_DIR", "snapshots")
 os.makedirs(SNAPSHOT_DIR, exist_ok=True)
 API = os.getenv("API_BASE_URL", "http://localhost:8000")
+
+# Set GCP credentials env var on startup if the file exists
+_creds_path = os.path.abspath(os.path.join("secrets", "gcp_credentials.json"))
+if os.path.exists(_creds_path):
+    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = _creds_path
 
 # PAGE CONFIGURATION
 st.set_page_config(
@@ -188,6 +198,25 @@ def update_camera(camera_id, name, stream_url, location):
 def delete_camera(camera_id):
     return api_delete(f"/cameras/{camera_id}")
 
+def login(username, password):
+    return api_post("/auth/login", {"username": username, "password": password})
+
+def has_users():
+    result = api_get("/auth/has_users")
+    return result.get("has_users", False) if result else False
+
+def fetch_users():
+    return api_get("/users") or []
+
+def create_user(username, password, role):
+    return api_post("/users", {"username": username, "password": password, "role": role})
+
+def delete_user(user_id):
+    return api_delete(f"/users/{user_id}")
+
+def setup_admin(username, password):
+    return api_post("/auth/setup", {"username": username, "password": password})
+
 # API HEALTH CHECK
 api_ok    = False
 api_error = ""
@@ -256,6 +285,13 @@ with st.sidebar:
 
     st.markdown(f"<span style='font-size:0.75rem;color:#6b7280;'>Updated: {datetime.now().strftime('%H:%M:%S')}</span>", unsafe_allow_html=True)
 
+    if st.session_state.get("logged_in"):
+        st.markdown("---")
+        st.markdown(f"<span style='font-size:0.8rem;color:#6b7280;'>Logged in as <b style='color:#e8eaf0;'>{st.session_state.get('username','')}</b> ({st.session_state.get('role','')})</span>", unsafe_allow_html=True)
+        if st.button("🚪 Log Out", use_container_width=True):
+            st.session_state.clear()
+            st.rerun()
+
 # API OFFLINE GUARD
 if not api_ok:
     st.markdown(f"""
@@ -266,6 +302,56 @@ if not api_ok:
         <span style="color:#6b7280;font-size:0.82rem;">{api_error}</span>
     </div>
     """, unsafe_allow_html=True)
+    st.stop()
+
+# AUTH GATE
+if not st.session_state.get("logged_in"):
+
+    # First time setup — no users exist yet
+    if not has_users():
+        st.markdown('<div class="page-header">// FIRST TIME SETUP</div>', unsafe_allow_html=True)
+        st.markdown("""
+        <div class="info-box">
+            👋 Welcome to Sentinel. No users exist yet — create your admin account to get started.
+        </div>
+        """, unsafe_allow_html=True)
+        with st.form("setup_form"):
+            su_user = st.text_input("Admin Username")
+            su_pass = st.text_input("Password",        type="password")
+            su_conf = st.text_input("Confirm Password", type="password")
+            if st.form_submit_button("🚀 Create Admin Account", use_container_width=True):
+                if not su_user.strip() or not su_pass:
+                    st.error("Username and password cannot be empty.")
+                elif su_pass != su_conf:
+                    st.error("Passwords do not match.")
+                elif len(su_pass) < 5:
+                    st.error("Password must be at least 5 characters.")
+                else:
+                    result = setup_admin(su_user.strip(), su_pass)
+                    if result:
+                        st.success("Admin account created! You can now log in.")
+                        st.rerun()
+                    else:
+                        st.error("Setup failed. Make sure the API is running.")
+        st.stop()
+
+    # Normal login
+    st.markdown('<div class="page-header">// LOGIN</div>', unsafe_allow_html=True)
+    with st.form("login_form"):
+        username = st.text_input("Username")
+        password = st.text_input("Password", type="password")
+        if st.form_submit_button("🔐 Log In", use_container_width=True):
+            if not username.strip() or not password:
+                st.error("Please enter your username and password.")
+            else:
+                result = login(username.strip(), password)
+                if result and result.get("success"):
+                    st.session_state["logged_in"] = True
+                    st.session_state["username"]  = result["username"]
+                    st.session_state["role"]      = result["role"]
+                    st.rerun()
+                else:
+                    st.error("Invalid username or password.")
     st.stop()
 
 # PAGE: LIVE FEED
@@ -290,7 +376,7 @@ if page == "Live Feed":
                 with grid[i % 2]:
                     location_label = f" — {cam['location']}" if cam["location"] else ""
                     st.markdown(f"<span style='font-family:var(--mono);color:var(--accent);font-size:0.82rem;'>{cam['name']}{location_label}</span>", unsafe_allow_html=True)
-                    st.image(cam["stream_url"], use_container_width=True)
+                    st.image(cam["stream_url"], width='stretch')
         else:
             st.markdown("""
             <div style="background:#161922;border:1px solid #2a2d3a;border-radius:10px;
@@ -360,7 +446,7 @@ elif page == "Event History":
         df["Snapshot"] = df["Snapshot"].apply(lambda x: "📷" if x and str(x) != "nan" else "—")
         st.dataframe(
             df[["ID", "Timestamp", "Zone", "Type", "Alert", "Snapshot"]],
-            use_container_width=True,
+            width='stretch',
             hide_index=True,
         )
         st.markdown("---")
@@ -387,7 +473,7 @@ elif page == "Event History":
 
             snap_col, info_col = st.columns([2, 1])
             with snap_col:
-                st.image(selected_event["snapshot_path"], use_container_width=True)
+                st.image(selected_event["snapshot_path"], width='stretch')
             with info_col:
                 alert = selected_event["alert_level"]
                 badge = ALERT_BADGE.get(alert, "")
@@ -437,7 +523,7 @@ elif page == "Smart Zones":
         with zones_col:
             st.markdown(f"**Preview — {selected_cam_name}**")
             try:
-                st.image(selected_cam_url, use_container_width=True)
+                st.image(selected_cam_url, width='stretch')
             except Exception:
                 st.markdown("""
                 <div style="background:#161922;border:1px solid #2a2d3a;border-radius:10px;
@@ -525,7 +611,7 @@ elif page == "Smart Zones":
                         cv2.putText(frame_bgr, label, (nx1 + 4, ny1 + 16),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 229, 255), 1)
 
-                    st.image(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB), use_container_width=True)
+                    st.image(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB), width='stretch')
             else:
                 st.markdown("""
                 <div style="background:#161922;border:1px solid #2a2d3a;border-radius:8px;
@@ -536,7 +622,7 @@ elif page == "Smart Zones":
                 """, unsafe_allow_html=True)
 
             st.markdown("")
-            if st.button("➕ Add Zone", key="add_zone_btn", use_container_width=True):
+            if st.button("➕ Add Zone", key="add_zone_btn", width='stretch'):
                 if not zone_name.strip():
                     st.error("Zone name cannot be empty.")
                 elif x2 <= x1 or y2 <= y1:
@@ -588,19 +674,31 @@ elif page == "Cameras":
 
                 # Inline edit form
                 if st.session_state.get("editing_cam") == cam["id"]:
+                    # Parse existing URL back into IP and port for pre-filling
+                    existing_url  = cam["stream_url"]
+                    try:
+                        stripped  = existing_url.replace("http://", "")
+                        host_part = stripped.split("/")[0]
+                        ex_ip, ex_port = host_part.rsplit(":", 1)
+                    except Exception:
+                        ex_ip, ex_port = "", "8080"
+
                     with st.form(f"edit_cam_form_{cam['id']}", clear_on_submit=True):
                         st.markdown("**Edit Camera**")
                         new_name     = st.text_input("Camera Name", value=cam["name"])
-                        new_url      = st.text_input("Stream URL",  value=cam["stream_url"])
                         new_location = st.text_input("Location",    value=cam["location"] or "")
+                        ip_col, port_col = st.columns([3, 1])
+                        new_ip   = ip_col.text_input("IP Address", value=ex_ip)
+                        new_port = port_col.text_input("Port",     value=ex_port)
                         s1, s2 = st.columns(2)
                         if s1.form_submit_button("💾 Save"):
-                            if not new_name.strip() or not new_url.strip():
-                                st.error("Name and URL cannot be empty.")
+                            if not new_name.strip() or not new_ip.strip():
+                                st.error("Name and IP address cannot be empty.")
                             else:
-                                update_camera(cam["id"], new_name.strip(), new_url.strip(), new_location.strip() or None)
+                                new_url = f"http://{new_ip.strip()}:{new_port.strip()}/stream"
+                                update_camera(cam["id"], new_name.strip(), new_url, new_location.strip() or None)
                                 st.session_state.pop("editing_cam", None)
-                                st.success("Camera updated!")
+                                st.success(f"Camera updated! Stream: {new_url}")
                                 st.rerun()
                         if s2.form_submit_button("✖ Cancel"):
                             st.session_state.pop("editing_cam", None)
@@ -612,22 +710,26 @@ elif page == "Cameras":
         st.markdown("**Add New Camera**")
         with st.form("add_camera_form", clear_on_submit=True):
             cam_name     = st.text_input("Camera Name", placeholder="e.g. Front Door Cam")
-            cam_url      = st.text_input("Stream URL",  placeholder="http://192.168.1.10:8080/stream")
             cam_location = st.text_input("Location",    placeholder="e.g. Front Porch")
+            ip_col, port_col = st.columns([3, 1])
+            cam_ip   = ip_col.text_input("IP Address", placeholder="192.168.1.10")
+            cam_port = port_col.text_input("Port", value="8080")
             if st.form_submit_button("➕ Add Camera"):
                 if not cam_name.strip():
                     st.error("Camera name cannot be empty.")
-                elif not cam_url.strip():
-                    st.error("Stream URL cannot be empty.")
+                elif not cam_ip.strip():
+                    st.error("IP address cannot be empty.")
                 else:
-                    insert_camera(cam_name.strip(), cam_url.strip(), cam_location.strip() or None)
-                    st.success(f"Camera '{cam_name}' added!")
+                    cam_url = f"http://{cam_ip.strip()}:{cam_port.strip()}/stream"
+                    insert_camera(cam_name.strip(), cam_url, cam_location.strip() or None)
+                    st.success(f"Camera '{cam_name}' added! Stream: {cam_url}")
                     st.rerun()
 
 # PAGE: SETTINGS
 elif page == "Settings":
     st.markdown('<div class="page-header">// SETTINGS</div>', unsafe_allow_html=True)
 
+    # API & Database
     st.markdown("**API & Database**")
     st.markdown("""
     <div class="info-box">
@@ -641,28 +743,230 @@ elif page == "Settings":
     else:
         st.markdown('<span class="badge badge-red">● API Offline</span>', unsafe_allow_html=True)
 
-    st.markdown("---")
-    st.markdown("**Camera**")
-    st.markdown("""
-    <div class="info-box">
-        Camera streams are managed on the <b>Cameras</b> page.
-    </div>
-    """, unsafe_allow_html=True)
-    c1, c2 = st.columns(2)
-    c1.number_input("Capture Interval (seconds)", 1, 60, 5)
-    c2.number_input("Motion Sensitivity (0–100)", 0, 100, 50)
+    st.markdown("")
+    doc_col1, doc_col2 = st.columns(2)
+    with doc_col1:
+        st.link_button("📖 Swagger UI Docs", f"{API}/docs", width='stretch')
+    with doc_col2:
+        st.link_button("📄 ReDoc Docs", f"{API}/redoc", width='stretch')
 
     st.markdown("---")
-    st.markdown("**GCP Configuration**")
+
+    # Detection Settings
+    st.markdown("**Detection Settings**")
+    st.markdown("""
+    <div class="info-box">
+        These settings are saved to <code>settings.json</code> and read by
+        <code>sentinel_detect.py</code> on each detection cycle. Changes take
+        effect on the next capture without restarting the script.
+    </div>
+    """, unsafe_allow_html=True)
+
+    # Load existing settings.json if it exists
+    settings_path = "settings.json"
+    saved_settings = {}
+    if os.path.exists(settings_path):
+        import json
+        try:
+            with open(settings_path) as f:
+                saved_settings = json.load(f)
+        except Exception:
+            saved_settings = {}
+
+    current_interval   = saved_settings.get("capture_interval", int(os.getenv("CAPTURE_INTERVAL", 10)))
+    current_confidence = saved_settings.get("confidence_min",   float(os.getenv("CONFIDENCE_MIN", 0.55)))
+
     c1, c2 = st.columns(2)
-    c1.text_input("GCP Project ID", placeholder="my-gcp-project")
-    c2.selectbox("Vision API Model", ["builtin/stable", "builtin/latest"])
+    new_interval   = c1.number_input("Capture Interval (seconds)",
+                                     min_value=1, max_value=300,
+                                     value=current_interval,
+                                     help="How often sentinel_detect.py grabs a frame per camera.")
+    new_confidence = c2.slider("Detection Confidence (0.0 – 1.0)",
+                               min_value=0.0, max_value=1.0,
+                               value=float(current_confidence),
+                               step=0.01,
+                               help="Minimum GCP Vision confidence to count as a real detection.")
+
+    if st.button("💾 Save Detection Settings"):
+        import json
+        with open(settings_path, "w") as f:
+            json.dump({
+                "capture_interval": new_interval,
+                "confidence_min":   new_confidence,
+            }, f, indent=2)
+        st.success(f"Settings saved — interval: {new_interval}s, confidence: {new_confidence:.2f}")
+
+    st.markdown("---")
+
+    # GCP Credentials
+    st.markdown("**GCP Credentials**")
+
+    creds_path = os.path.join("secrets", "gcp_credentials.json")
+    os.makedirs("secrets", exist_ok=True)
+
+    # Set env var for this Streamlit process if the file exists
+    if os.path.exists(creds_path):
+        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = os.path.abspath(creds_path)
+
+    if os.path.exists(creds_path):
+        st.markdown(f'<span class="badge badge-green">● Credentials file found</span> &nbsp; <code>{creds_path}</code>', unsafe_allow_html=True)
+    else:
+        st.markdown(f'<span class="badge badge-red">● Not found</span> &nbsp; Expected at <code>{creds_path}</code>', unsafe_allow_html=True)
+
+    uploaded_creds = st.file_uploader(
+        "Upload GCP Service Account JSON",
+        type=["json"],
+        help="Download from GCP Console → IAM & Admin → Service Accounts → Keys. Any filename is fine — it will be saved as gcp_credentials.json inside the secrets/ folder."
+    )
+
+    if uploaded_creds is not None:
+        import json
+        # Validate that it looks like a GCP service account file before saving
+        try:
+            parsed = json.loads(uploaded_creds.getvalue())
+            required_keys = {"type", "project_id", "private_key", "client_email"}
+            if not required_keys.issubset(parsed.keys()):
+                st.error("❌ This doesn't look like a valid GCP service account file. Make sure you downloaded the right JSON from GCP.")
+            elif parsed.get("type") != "service_account":
+                st.error(f"❌ Expected type 'service_account', got '{parsed.get('type')}'. Make sure you're uploading a Service Account key, not a different GCP credential type.")
+            else:
+                if st.button("💾 Save Credentials"):
+                    with open(creds_path, "wb") as f:
+                        f.write(uploaded_creds.getvalue())
+                    st.success(f"✅ Credentials saved to `{creds_path}` (project: `{parsed.get('project_id')}`, account: `{parsed.get('client_email')}`)")
+                    st.rerun()
+        except json.JSONDecodeError:
+            st.error("❌ Could not parse the file as JSON. Make sure you're uploading the correct file.")
+
+    # Verify credentials button
+    if os.path.exists(creds_path):
+        if st.button("🔍 Verify GCP Vision Connection"):
+            try:
+                from google.cloud import vision
+                # Must set the env var in this process before initialising the client
+                os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = os.path.abspath(creds_path)
+                client   = vision.ImageAnnotatorClient()
+                # Generate a 1x1 white JPEG using cv2 and read it back as bytes
+                test_img_path = "/tmp/sentinel_gcp_test.jpg"
+                cv2.imwrite(test_img_path, np.ones((1, 1, 3), dtype=np.uint8) * 255)
+                with open(test_img_path, "rb") as f:
+                    test_img = f.read()
+                image = vision.Image(content=test_img)
+                client.object_localization(image=image)
+                st.success("✅ GCP Vision API connected and working!")
+            except Exception as ex:
+                st.error(f"❌ GCP Vision test failed: {ex}")
+
+    st.markdown("---")
+
+    # User Management — admin only
+    st.markdown("**User Management**")
+    if st.session_state.get("role") != "admin":
+        st.markdown("""
+        <div class="info-box">
+            🔒 User management is only available to admin users.
+        </div>
+        """, unsafe_allow_html=True)
+    else:
+        users = fetch_users()
+        if users:
+            for u in users:
+                u_col, r_col, d_col = st.columns([2, 1, 1])
+                u_col.markdown(f"<span style='font-family:var(--mono);color:#e8eaf0;'>{u['username']}</span>", unsafe_allow_html=True)
+                r_col.markdown(f"<span class=\"badge {'badge-blue' if u['role'] == 'admin' else 'badge-green'}\">{u['role']}</span>", unsafe_allow_html=True)
+                with d_col:
+                    if u["username"] != st.session_state.get("username"):
+                        st.markdown('<div class="danger-btn">', unsafe_allow_html=True)
+                        if st.button("🗑", key=f"del_user_{u['id']}"):
+                            result = delete_user(u["id"])
+                            if result:
+                                st.success(f"User '{u['username']}' removed.")
+                                st.rerun()
+                            else:
+                                st.error("Could not delete — cannot remove the last admin.")
+                        st.markdown('</div>', unsafe_allow_html=True)
+                    else:
+                        st.caption("(you)")
+        else:
+            st.caption("No users found.")
+
+        st.markdown("")
+        st.markdown("**Add New User**")
+        with st.form("add_user_form", clear_on_submit=True):
+            new_uname = st.text_input("Username")
+            new_upass = st.text_input("Password", type="password")
+            new_urole = st.selectbox("Role", ["viewer", "admin"])
+            if st.form_submit_button("➕ Add User"):
+                if not new_uname.strip() or not new_upass:
+                    st.error("Username and password cannot be empty.")
+                elif len(new_upass) < 5:
+                    st.error("Password must be at least 5 characters.")
+                else:
+                    result = create_user(new_uname.strip(), new_upass, new_urole)
+                    if result:
+                        st.success(f"User '{new_uname}' added as {new_urole}.")
+                        st.rerun()
+                    else:
+                        st.error("Username already exists or API error.")
 
     st.markdown("---")
     st.markdown("**Danger Zone**")
+
+    d1, d2, d3 = st.columns(3)
+
+    with d1:
+        st.markdown('<div class="danger-btn">', unsafe_allow_html=True)
+        if st.button("🗑 Clear All Events", width='stretch'):
+            api_delete("/events")
+            st.success("All event records cleared from database.")
+            st.rerun()
+        st.markdown('</div>', unsafe_allow_html=True)
+        st.caption("Deletes all event rows from the database. Snapshot files are kept.")
+
+    with d2:
+        st.markdown('<div class="danger-btn">', unsafe_allow_html=True)
+        if st.button("🗑 Clear All Zones", width='stretch'):
+            zones = fetch_zones()
+            for z in zones:
+                api_delete(f"/zones/{z['id']}")
+            st.success(f"Deleted {len(zones)} zone(s).")
+            st.rerun()
+        st.markdown('</div>', unsafe_allow_html=True)
+        st.caption("Deletes all configured zones. Events linked to them are kept.")
+
+    with d3:
+        st.markdown('<div class="danger-btn">', unsafe_allow_html=True)
+        if st.button("🗑 Clear All Snapshots", width='stretch'):
+            deleted = 0
+            if os.path.exists(SNAPSHOT_DIR):
+                for fname in os.listdir(SNAPSHOT_DIR):
+                    if fname.lower().endswith((".jpg", ".jpeg", ".png")):
+                        try:
+                            os.remove(os.path.join(SNAPSHOT_DIR, fname))
+                            deleted += 1
+                        except Exception:
+                            pass
+            st.success(f"Deleted {deleted} snapshot file(s) from `{SNAPSHOT_DIR}/`.")
+            st.rerun()
+        st.markdown('</div>', unsafe_allow_html=True)
+        st.caption("Deletes image files from disk. Event records in the database are kept.")
+
+    st.markdown("")
     st.markdown('<div class="danger-btn">', unsafe_allow_html=True)
-    if st.button("Clear All Events"):
+    if st.button("🗑 Clear Everything", width='stretch'):
+        # Clear DB events
         api_delete("/events")
-        st.success("All events cleared.")
+        # Clear snapshot files
+        deleted = 0
+        if os.path.exists(SNAPSHOT_DIR):
+            for fname in os.listdir(SNAPSHOT_DIR):
+                if fname.lower().endswith((".jpg", ".jpeg", ".png")):
+                    try:
+                        os.remove(os.path.join(SNAPSHOT_DIR, fname))
+                        deleted += 1
+                    except Exception:
+                        pass
+        st.success(f"All events cleared and {deleted} snapshot file(s) deleted.")
         st.rerun()
     st.markdown('</div>', unsafe_allow_html=True)
+    st.caption("Clears both the database event records and all snapshot files on disk.")

@@ -23,6 +23,7 @@ import psycopg2
 import psycopg2.extras
 import os
 import random
+import bcrypt
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -42,7 +43,7 @@ def get_db():
     return psycopg2.connect(
         host=os.getenv("POSTGRES_HOST"),
         port=int(os.getenv("POSTGRES_PORT", 5432)),
-        dbname=os.getenv("POSTGRES_DB", "smartsentinel"),
+        dbname=os.getenv("POSTGRES_DB", "sentinel"),
         user=os.getenv("POSTGRES_USER", "postgres"),
         password=os.getenv("POSTGRES_PASSWORD", ""),
     )
@@ -76,6 +77,7 @@ def init_db():
                 x2          REAL NOT NULL,
                 y2          REAL NOT NULL,
                 camera_id   INTEGER REFERENCES cameras(id) ON DELETE SET NULL,
+                active      BOOLEAN DEFAULT TRUE,
                 created_at  TIMESTAMP DEFAULT NOW()
             );
         """)
@@ -89,10 +91,24 @@ def init_db():
                 snapshot_path  TEXT
             );
         """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id            SERIAL PRIMARY KEY,
+                username      TEXT NOT NULL UNIQUE,
+                password_hash TEXT NOT NULL,
+                role          TEXT NOT NULL DEFAULT 'admin'
+                                  CHECK (role IN ('admin','viewer')),
+                created_at    TIMESTAMP DEFAULT NOW()
+            );
+        """)
         # Migration safety net for existing databases
         cur.execute("""
             ALTER TABLE zones ADD COLUMN IF NOT EXISTS
             camera_id INTEGER REFERENCES cameras(id) ON DELETE SET NULL;
+        """)
+        cur.execute("""
+            ALTER TABLE zones ADD COLUMN IF NOT EXISTS
+            active BOOLEAN DEFAULT TRUE;
         """)
         conn.commit()
     conn.close()
@@ -100,6 +116,15 @@ def init_db():
 
 
 # PYDANTIC MODELS
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+class UserCreate(BaseModel):
+    username: str
+    password: str
+    role:     str = "admin"
+
 class CameraCreate(BaseModel):
     name:       str
     stream_url: str
@@ -143,6 +168,106 @@ def health():
         return {"status": "ok", "database": "connected"}
     except Exception as e:
         raise HTTPException(status_code=503, detail=f"Database unavailable: {e}")
+
+# AUTH
+@app.post("/auth/setup", status_code=201)
+def setup_admin(body: UserCreate):
+    """
+    Creates the first admin user. Fails if any users already exist.
+    Used for first-time setup only.
+    """
+    conn = get_db()
+    with conn.cursor() as cur:
+        cur.execute("SELECT COUNT(*) FROM users;")
+        if cur.fetchone()[0] > 0:
+            conn.close()
+            raise HTTPException(status_code=409, detail="Setup already complete. Users already exist.")
+        password_hash = bcrypt.hashpw(body.password.encode(), bcrypt.gensalt()).decode()
+        cur.execute("""
+            INSERT INTO users (username, password_hash, role)
+            VALUES (%s, %s, 'admin');
+        """, (body.username.strip(), password_hash))
+        conn.commit()
+    conn.close()
+    return {"message": f"Admin user '{body.username}' created successfully."}
+
+@app.post("/auth/login")
+def login(body: LoginRequest):
+    """Validates credentials. Returns user info on success."""
+    conn = get_db()
+    with dict_cursor(conn) as cur:
+        cur.execute("SELECT * FROM users WHERE username = %s;", (body.username.strip(),))
+        user = cur.fetchone()
+    conn.close()
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid username or password.")
+    if not bcrypt.checkpw(body.password.encode(), user["password_hash"].encode()):
+        raise HTTPException(status_code=401, detail="Invalid username or password.")
+    return {
+        "success":  True,
+        "username": user["username"],
+        "role":     user["role"],
+    }
+
+@app.get("/auth/has_users")
+def has_users():
+    """Returns whether any users exist. Used to detect first-time setup."""
+    conn = get_db()
+    with conn.cursor() as cur:
+        cur.execute("SELECT COUNT(*) FROM users;")
+        count = cur.fetchone()[0]
+    conn.close()
+    return {"has_users": count > 0}
+
+# USERS
+@app.get("/users")
+def list_users():
+    conn = get_db()
+    with dict_cursor(conn) as cur:
+        cur.execute("SELECT id, username, role, created_at FROM users ORDER BY id;")
+        rows = cur.fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+@app.post("/users", status_code=201)
+def create_user(body: UserCreate):
+    if body.role not in ("admin", "viewer"):
+        raise HTTPException(status_code=422, detail="Role must be 'admin' or 'viewer'.")
+    conn = get_db()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            password_hash = bcrypt.hashpw(body.password.encode(), bcrypt.gensalt()).decode()
+            cur.execute("""
+                INSERT INTO users (username, password_hash, role)
+                VALUES (%s, %s, %s) RETURNING id, username, role, created_at;
+            """, (body.username.strip(), password_hash, body.role))
+            row = cur.fetchone()
+            conn.commit()
+    except psycopg2.errors.UniqueViolation:
+        conn.rollback()
+        conn.close()
+        raise HTTPException(status_code=409, detail=f"Username '{body.username}' already exists.")
+    conn.close()
+    return dict(row)
+
+@app.delete("/users/{user_id}", status_code=204)
+def delete_user(user_id: int):
+    conn = get_db()
+    with conn.cursor() as cur:
+        # Prevent deleting the last admin
+        cur.execute("SELECT role FROM users WHERE id = %s;", (user_id,))
+        user = cur.fetchone()
+        if not user:
+            conn.close()
+            raise HTTPException(status_code=404, detail="User not found.")
+        if user[0] == "admin":
+            cur.execute("SELECT COUNT(*) FROM users WHERE role = 'admin';")
+            if cur.fetchone()[0] <= 1:
+                conn.close()
+                raise HTTPException(status_code=400, detail="Cannot delete the last admin user.")
+        cur.execute("DELETE FROM users WHERE id = %s;", (user_id,))
+        conn.commit()
+    conn.close()
 
 # CAMERAS
 @app.get("/cameras")
@@ -260,10 +385,18 @@ def update_zone(zone_id: int, body: ZoneUpdate):
 def delete_zone(zone_id: int):
     conn = get_db()
     with conn.cursor() as cur:
-        cur.execute("DELETE FROM zones WHERE id = %s;", (zone_id,))
+        cur.execute("UPDATE zones SET active = FALSE WHERE id = %s;", (zone_id,))
         conn.commit()
     conn.close()
 
+@app.delete("/zones", status_code=204)
+def clear_zones():
+    """Soft-deletes all zones — preserves event history references."""
+    conn = get_db()
+    with conn.cursor() as cur:
+        cur.execute("UPDATE zones SET active = FALSE;")
+        conn.commit()
+    conn.close()
 # EVENTS
 @app.get("/events")
 def list_events(
