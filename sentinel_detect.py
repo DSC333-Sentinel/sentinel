@@ -71,7 +71,8 @@ def fetch_zones_for_camera(conn, camera_id):
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         cur.execute("""
             SELECT * FROM zones
-            WHERE camera_id = %s OR camera_id IS NULL
+            WHERE (camera_id = %s OR camera_id IS NULL)
+            AND active = TRUE
             ORDER BY id;
         """, (camera_id,))
         return cur.fetchall()
@@ -209,6 +210,11 @@ def main():
                 if persons:
                     # Check zone overlap
                     zones = fetch_zones_for_camera(conn, cam["id"])
+                    print(f"  Zones loaded for camera {cam['id']}: {len(zones)}")
+                    for z in zones:
+                        print(f"    Zone '{z['name']}': ({z['x1']:.2f},{z['y1']:.2f}) → ({z['x2']:.2f},{z['y2']:.2f}) [{z['alert_level']}]")
+                    for p in persons:
+                        print(f"    Person center: cx={p['cx']:.2f}, cy={p['cy']:.2f} (confidence={p['score']:.2f})")
                     triggered_zone = find_triggered_zone(persons, zones)
 
                     snapshot_path = save_snapshot(
